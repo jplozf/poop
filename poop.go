@@ -63,12 +63,42 @@ func main() {
 	}
 
 	fmt.Println("Welcome to Poop P2P.")
-	// 1. Create the Libp2p Host
-	h, err = libp2p.New(libp2p.ListenAddrStrings("/ip4/0.0.0.0/tcp/0"))
+	// 1. Create the Libp2p Host with NAT traversal capabilities
+	h, err = libp2p.New(
+		libp2p.ListenAddrStrings(
+			"/ip4/0.0.0.0/tcp/0",         // Regular TCP
+			"/ip4/0.0.0.0/udp/0/quic-v1", // QUIC-v1 for better hole punching
+		),
+		libp2p.NATPortMap(),         // Attempt to open ports via UPnP/NAT-PMP
+		libp2p.EnableRelay(),        // Allows this node to use relays to reach others
+		libp2p.EnableHolePunching(), // Enables DCUtR hole punching
+	)
 	if err != nil {
 		panic(err)
 	}
 	defer h.Close()
+
+	// 1.5 Connect to bootstrap nodes to find relays and discover our external IP
+	bootstrapNodes := []string{
+		"/ip4/104.131.131.82/tcp/4001/p2p/QmaCpDMGvLcZunBNqv9U7Zkx6n6TVv4N497Xp9EWiZfWob",
+		"/dnsaddr/bootstrap.libp2p.io/p2p/QmNnooP7bfuAGnS2V1qSEpT6B9W5itW39pVRJ3f7qXmSSW",
+		"/dnsaddr/bootstrap.libp2p.io/p2p/QmQCU2EcSTwsNBVB6nxGbtTVTSpx67uYv9SStm6D8Cq3H2",
+		"/dnsaddr/bootstrap.libp2p.io/p2p/QmbLHAnMo9iavMyaH7YvUXdf22Qx8Qo3AAn2CyF7C2QByq",
+	}
+
+	for _, addrStr := range bootstrapNodes {
+		ma, err := multiaddr.NewMultiaddr(strings.TrimSpace(addrStr))
+		if err != nil {
+			fmt.Printf("Error parsing bootstrap addr: %s\n", err)
+			continue
+		}
+		peerinfo, err := peer.AddrInfoFromP2pAddr(ma)
+		if err != nil {
+			fmt.Printf("Error getting peer info: %s\n", err)
+			continue
+		}
+		h.Connect(ctx, *peerinfo)
+	}
 
 	// 2. Setup the Listener (Receiver) logic
 	h.SetStreamHandler(protocolID, func(s network.Stream) {
@@ -97,7 +127,8 @@ func main() {
 	})
 
 	// 3. Print local info so others can connect to us
-	fmt.Println("Your Peer ID :", h.ID())
+	fmt.Println("Your Peer ID:", h.ID())
+	fmt.Println("System starting... type 'status' in a few seconds to see your public addresses.")
 	for _, addr := range h.Addrs() {
 		fmt.Printf("Connect to me at: %s/p2p/%s\n", addr, h.ID())
 	}
@@ -215,8 +246,14 @@ func handleCommandInput(input string, h host.Host) {
 		// This is the function we wrote earlier that calls h.NewStream
 		startSession(context.Background(), h, targetAddr)
 
+	case "status":
+		fmt.Println("Current Addresses:")
+		for _, addr := range h.Addrs() {
+			fmt.Printf(" - %s/p2p/%s\n", addr, h.ID())
+		}
+
 	case "help":
-		fmt.Println("Available commands: connect <addr>, exit, help")
+		fmt.Println("Available commands: connect <addr>, status, exit, help")
 
 	case "exit":
 		fmt.Println("Goodbye!")
