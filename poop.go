@@ -6,17 +6,22 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
+	"flag"
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/libp2p/go-libp2p"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
+	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -36,10 +41,11 @@ type AppState int
 // CONSTS
 // ****************************************************************************
 const (
-	protocolID                 = "/poop/sync/1.0.0"
-	StateIdle         AppState = iota
-	StateAwaitingAuth          // We received a request, waiting for user to type 'y' or 'n'
-	StateInSession             // We are actively talking to someone
+	defaultBootstrapPort          = 42001
+	protocolID                    = "/poop/sync/1.0.0"
+	StateIdle            AppState = iota
+	StateAwaitingAuth             // We received a request, waiting for user to type 'y' or 'n'
+	StateInSession                // We are actively talking to someone
 )
 
 // ****************************************************************************
@@ -102,6 +108,10 @@ type discoveryNotifee struct {
 }
 
 func (n *discoveryNotifee) HandlePeerFound(pi peer.AddrInfo) {
+	if app == nil {
+		return
+	}
+
 	idx := registerPeer(pi.ID)
 	app.QueueUpdateDraw(func() {
 		fmt.Fprintf(commandView, "[green][Discovery][-]: Found peer [$%d] %s with %d addresses\n", idx, pi.ID, len(pi.Addrs))
@@ -118,6 +128,14 @@ func (n *discoveryNotifee) HandlePeerFound(pi peer.AddrInfo) {
 // main()
 // ****************************************************************************
 func main() {
+	isServer := flag.Bool("s", false, "run as a bootstrap server (headless)")
+	flag.Parse()
+
+	if *isServer {
+		runBootstrapServer()
+		return
+	}
+
 	// 1. Initialize UI
 	app = tview.NewApplication()
 
@@ -617,6 +635,120 @@ func discoverPeers(ctx context.Context, h host.Host, idht *dht.IpfsDHT, rendezvo
 			}
 		}
 	}
+}
+
+// ****************************************************************************
+// SERVER MODE FUNCTIONS
+// ****************************************************************************
+
+func runBootstrapServer() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	fmt.Println("[*] Starting Standalone Poop Bootstrap Node...")
+
+	// 1. Load or Generate Identity
+	priv, err := loadOrGenerateKey("bootstrap.key")
+	if err != nil {
+		fmt.Printf("[!] Identity error: %v\n", err)
+		return
+	}
+
+	// 2. Initialize the Libp2p Host
+	// Using port 40001 to bypass ISP restrictions on ports under 40000
+	h, err := libp2p.New(
+		libp2p.Identity(priv),
+		libp2p.ListenAddrStrings(
+			fmt.Sprintf("/ip4/0.0.0.0/tcp/%d", defaultBootstrapPort),
+			fmt.Sprintf("/ip4/0.0.0.0/udp/%d/quic-v1", defaultBootstrapPort),
+		),
+		libp2p.NATPortMap(),
+		libp2p.EnableRelay(),
+	)
+	if err != nil {
+		fmt.Printf("[!] Failed to create host: %v\n", err)
+		return
+	}
+	defer h.Close()
+
+	// 3. Initialize DHT in Server Mode
+	kdht, err := dht.New(ctx, h, dht.Mode(dht.ModeServer))
+	if err != nil {
+		fmt.Printf("[!] Failed to initialize DHT: %v\n", err)
+		return
+	}
+
+	if err = kdht.Bootstrap(ctx); err != nil {
+		fmt.Printf("[!] DHT Bootstrap error: %v\n", err)
+		return
+	}
+
+	// 4. Output connectivity info
+	fmt.Println("\n============================================================")
+	fmt.Println("BOOTSTRAP NODE ONLINE")
+	fmt.Printf("Peer ID: %s\n", h.ID())
+
+	// Track addresses we've already printed to avoid duplicates
+	seenAddrs := make(map[string]bool)
+	printNewAddrs := func() {
+		for _, addr := range h.Addrs() {
+			fullAddr := fmt.Sprintf("%s/p2p/%s", addr, h.ID())
+			if !seenAddrs[fullAddr] {
+				fmt.Printf("[+] Detected Address: %s\n", fullAddr)
+				seenAddrs[fullAddr] = true
+			}
+		}
+	}
+
+	printNewAddrs()
+	fmt.Println("============================================================")
+	fmt.Println("\nMonitoring for new network addresses (AutoNAT/Relay)...")
+	fmt.Println("Press Ctrl+C to stop the server.")
+
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				printNewAddrs()
+			}
+		}
+	}()
+
+	// 5. Wait for termination signal
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	<-sigCh
+
+	fmt.Println("\n[*] Shutting down...")
+}
+
+func loadOrGenerateKey(path string) (crypto.PrivKey, error) {
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		fmt.Printf("[+] No identity found. Generating new key: %s\n", path)
+		priv, _, err := crypto.GenerateEd25519Key(rand.Reader)
+		if err != nil {
+			return nil, err
+		}
+		data, err := crypto.MarshalPrivateKey(priv)
+		if err != nil {
+			return nil, err
+		}
+		if err := os.WriteFile(path, data, 0600); err != nil {
+			return nil, err
+		}
+		return priv, nil
+	}
+
+	fmt.Printf("[+] Loading existing identity from %s\n", path)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	return crypto.UnmarshalPrivateKey(data)
 }
 
 /*
