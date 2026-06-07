@@ -77,6 +77,25 @@ func registerPeer(id peer.ID) int {
 	return len(discoveredPeers)
 }
 
+func resolveCommand(input string, commands []string) (string, error) {
+	var matches []string
+	for _, cmd := range commands {
+		if cmd == input {
+			return cmd, nil // Exact match always wins
+		}
+		if strings.HasPrefix(cmd, input) {
+			matches = append(matches, cmd)
+		}
+	}
+	if len(matches) == 1 {
+		return matches[0], nil
+	}
+	if len(matches) > 1 {
+		return "", fmt.Errorf("ambiguous command '%s': could be %s", input, strings.Join(matches, ", "))
+	}
+	return "", fmt.Errorf("unknown command '%s'", input)
+}
+
 // discoveryNotifee gets notified when we find a new peer via mDNS
 type discoveryNotifee struct {
 	h host.Host
@@ -203,8 +222,10 @@ func main() {
 		rw := bufio.NewReadWriter(bufio.NewReader(s), bufio.NewWriter(s))
 
 		str, _ := rw.ReadString('\n')
+		idx := registerPeer(s.Conn().RemotePeer())
+		content := strings.TrimSpace(str)
 		app.QueueUpdateDraw(func() {
-			fmt.Fprintf(chatView, "[Peer]: %s", str)
+			fmt.Fprintf(chatView, "[yellow]%s[-]: %s\n", tview.Escape(fmt.Sprintf("[$%d]", idx)), content)
 		})
 		s.Close()
 	})
@@ -379,9 +400,14 @@ func handleCommandInput(input string, h host.Host) {
 		return
 	}
 
-	command := parts[0]
+	available := []string{"connect", "room", "peers", "status", "help", "id", "exit", "quit", "bye", "bootstrap"}
+	resolved, err := resolveCommand(parts[0], available)
+	if err != nil {
+		fmt.Fprintf(commandView, "[red]%s[-]. Type 'help' for info.\n", err)
+		return
+	}
 
-	switch command {
+	switch resolved {
 	case "connect":
 		if len(parts) < 2 {
 			fmt.Fprintln(commandView, "Usage: connect <multiaddr_or_peerID_or_$index> (e.g., connect $1)")
@@ -426,8 +452,31 @@ func handleCommandInput(input string, h host.Host) {
 			fmt.Fprintf(commandView, " - %s/p2p/%s\n", addr, h.ID())
 		}
 
+	case "bootstrap":
+		if len(parts) < 2 {
+			fmt.Fprintln(commandView, "Usage: bootstrap <multiaddr>")
+			return
+		}
+		addrStr := parts[1]
+		ma, err := multiaddr.NewMultiaddr(addrStr)
+		if err != nil {
+			fmt.Fprintf(commandView, "[red]Error parsing bootstrap addr: %s[-]\n", err)
+			return
+		}
+		peerinfo, err := peer.AddrInfoFromP2pAddr(ma)
+		if err != nil {
+			fmt.Fprintf(commandView, "[red]Error getting peer info: %s[-]\n", err)
+			return
+		}
+		if err := h.Connect(ctx, *peerinfo); err != nil {
+			fmt.Fprintf(commandView, "[red]Failed to connect to bootstrap node: %s[-]\n", err)
+		} else {
+			fmt.Fprintf(commandView, "[green]Connected to bootstrap node: %s[-]\n", peerinfo.ID)
+			kademliaDHT.Bootstrap(ctx)
+		}
+
 	case "help":
-		fmt.Fprintln(commandView, "Available commands: connect <addr>, room <name>, id, peers, status, exit, quit, bye, help")
+		fmt.Fprintln(commandView, "Available commands: connect <addr>, room <name>, bootstrap <addr>, id, peers, status, exit, quit, bye, help")
 
 	case "id":
 		fmt.Fprintf(commandView, "[yellow]Share this address with your peer:[-]\n")
@@ -438,7 +487,7 @@ func handleCommandInput(input string, h host.Host) {
 		app.Stop()
 
 	default:
-		fmt.Fprintf(commandView, "[red]Unknown command: %s.[-] Type 'help' for info.\n", command)
+		fmt.Fprintf(commandView, "[red]Unknown command: %s.[-] Type 'help' for info.\n", parts[0])
 	}
 }
 
@@ -448,7 +497,20 @@ func handleCommandInput(input string, h host.Host) {
 func handleSessionInput(input string) {
 	// Check if the input is a command (starts with /)
 	if strings.HasPrefix(input, "/") {
-		if input == "/quit" {
+		cmdStr := strings.TrimPrefix(input, "/")
+		parts := strings.Fields(cmdStr)
+		if len(parts) == 0 {
+			return
+		}
+
+		available := []string{"connect", "room", "peers", "status", "help", "id", "exit", "quit", "bye", "bootstrap"}
+		resolved, err := resolveCommand(parts[0], available)
+		if err != nil {
+			fmt.Fprintf(commandView, "[red]%s[-]\n", err)
+			return
+		}
+
+		if resolved == "quit" {
 			fmt.Fprintln(commandView, "Closing session...")
 			pendingStream.Close()
 			currentStatus = StateIdle
@@ -456,11 +518,11 @@ func handleSessionInput(input string) {
 			return
 		}
 		// Forward other commands (like /status or /help) to the command handler
-		handleCommandInput(strings.TrimPrefix(input, "/"), h)
+		handleCommandInput(resolved+" "+strings.Join(parts[1:], " "), h)
 		return
 	}
 
-	fmt.Fprintf(chatView, "[blue][Me]: %s[-]\n", input)
+	fmt.Fprintf(chatView, "[blue]%s[-]: %s\n", tview.Escape("[me]"), input)
 
 	// We use the 'pendingStream' we saved earlier during the ACK
 	rw := bufio.NewReadWriter(bufio.NewReader(pendingStream), bufio.NewWriter(pendingStream))
@@ -504,10 +566,11 @@ func handleAuthInput(input string) {
 func startReadLoop(s network.Stream) {
 	go func() {
 		scanner := bufio.NewScanner(s)
+		idx := registerPeer(s.Conn().RemotePeer())
 		for scanner.Scan() {
 			msg := scanner.Text()
 			app.QueueUpdateDraw(func() {
-				fmt.Fprintf(chatView, "[Peer]: %s\n", msg)
+				fmt.Fprintf(chatView, "[yellow]%s[-]: %s\n", tview.Escape(fmt.Sprintf("[$%d]", idx)), msg)
 			})
 		}
 		if err := scanner.Err(); err != nil {
@@ -555,3 +618,12 @@ func discoverPeers(ctx context.Context, h host.Host, idht *dht.IpfsDHT, rendezvo
 		}
 	}
 }
+
+/*
+Standard Public Nodes:
+/ip4/104.131.131.82/tcp/4001/p2p/QmaCpDMGvLcZunBNqv9U7Zkx6n6TVv4N497Xp9EWiZfWob
+/ip4/104.236.179.241/tcp/4001/p2p/QmSoLP6zG1bsNqzqc8v9S7NmE6BNdnJa87u6pf8p8zKk5K
+/ip4/128.199.219.111/tcp/4001/p2p/QmSoLSafvU76usqS8ELXWwLyBp7FLaycWvevP4cW7uWj6T
+/ip4/104.236.76.40/tcp/4001/p2p/QmSoLMeWqB7YGVL2ox6V2Wv7VzYF6s9oV9mC2y2kYfU7pX
+/ip4/178.62.158.247/tcp/4001/p2p/QmSoLer265NRztuWsZURrshBWo658FmAn9TFnfp93Y68t6
+*/
