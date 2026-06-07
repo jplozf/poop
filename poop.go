@@ -9,6 +9,7 @@ import (
 	"crypto/rand"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -43,6 +44,7 @@ type AppState int
 const (
 	defaultBootstrapPort          = 42001
 	protocolID                    = "/poop/sync/1.0.0"
+	fileProtocolID                = "/poop/file/1.0.0"
 	StateIdle            AppState = iota
 	StateAwaitingAuth             // We received a request, waiting for user to type 'y' or 'n'
 	StateInSession                // We are actively talking to someone
@@ -54,6 +56,7 @@ const (
 var (
 	currentStatus = StateIdle
 	pendingStream network.Stream
+	incomingDir   string
 	historyFile   = filepath.Join(os.TempDir(), ".poop_history")
 	ctx           = context.Background()
 	h             host.Host
@@ -173,6 +176,14 @@ func main() {
 
 	fmt.Fprintln(commandView, "[yellow]Welcome to Poop P2P.[-]")
 
+	// Initialize incoming directory
+	homeDir, erd := os.UserHomeDir()
+	if erd != nil {
+		panic(fmt.Sprintf("Failed to get user home directory: %v", erd))
+	}
+	incomingDir = filepath.Join(homeDir, ".poop", "incoming")
+	os.MkdirAll(incomingDir, 0755) // Create if not exists
+
 	// 1. Create the Libp2p Host with NAT traversal capabilities
 	var err error
 	h, err = libp2p.New(
@@ -245,6 +256,50 @@ func main() {
 		app.QueueUpdateDraw(func() {
 			fmt.Fprintf(chatView, "[yellow]%s[-]: %s\n", tview.Escape(fmt.Sprintf("[$%d]", idx)), content)
 		})
+		s.Close()
+	})
+
+	h.SetStreamHandler(fileProtocolID, func(s network.Stream) {
+		remotePeer := s.Conn().RemotePeer()
+		idx := registerPeer(remotePeer)
+
+		reader := bufio.NewReader(s)
+		fileName, _ := reader.ReadString('\n')
+		fileName = strings.TrimSpace(fileName)
+		sizeStr, _ := reader.ReadString('\n')
+		size, _ := strconv.ParseInt(strings.TrimSpace(sizeStr), 10, 64)
+
+		app.QueueUpdateDraw(func() {
+			fmt.Fprintf(commandView, "[yellow][File] Receiving '%s' (%d bytes) from [$%d]...[-]\n", fileName, size, idx)
+		})
+
+		// Construct the full path for the incoming file
+		fullPath := filepath.Join(incomingDir, fileName)
+
+		// Check if a file with the same name already exists and append a number if it does
+		for i := 1; fileExists(fullPath); i++ {
+			fullPath = filepath.Join(incomingDir, fmt.Sprintf("%s_%d%s", strings.TrimSuffix(fileName, filepath.Ext(fileName)), i, filepath.Ext(fileName)))
+		}
+		out, err := os.Create(fullPath)
+		if err != nil {
+			app.QueueUpdateDraw(func() {
+				fmt.Fprintf(commandView, "[red]Failed to create file: %s[-]\n", err)
+			})
+			s.Reset()
+			return
+		}
+		defer out.Close()
+
+		_, err = io.CopyN(out, reader, size)
+		if err != nil {
+			app.QueueUpdateDraw(func() {
+				fmt.Fprintf(commandView, "[red]File transfer failed: %s[-]\n", err)
+			})
+		} else {
+			app.QueueUpdateDraw(func() {
+				fmt.Fprintf(commandView, "[green][File] '%s' saved successfully to %s[-]\n", fileName, fullPath)
+			})
+		}
 		s.Close()
 	})
 
@@ -418,7 +473,7 @@ func handleCommandInput(input string, h host.Host) {
 		return
 	}
 
-	available := []string{"connect", "room", "peers", "status", "help", "id", "exit", "quit", "bye", "bootstrap"}
+	available := []string{"connect", "room", "peers", "status", "help", "id", "exit", "quit", "bye", "bootstrap", "send"}
 	resolved, err := resolveCommand(parts[0], available)
 	if err != nil {
 		fmt.Fprintf(commandView, "[red]%s[-]. Type 'help' for info.\n", err)
@@ -493,8 +548,19 @@ func handleCommandInput(input string, h host.Host) {
 			kademliaDHT.Bootstrap(ctx)
 		}
 
+	case "send":
+		if currentStatus != StateInSession {
+			fmt.Fprintln(commandView, "[red]You must be in an active session to send files.[-]")
+			return
+		}
+		if len(parts) < 2 {
+			fmt.Fprintln(commandView, "Usage: /send <filepath>")
+			return
+		}
+		go sendFile(pendingStream.Conn().RemotePeer(), parts[1])
+
 	case "help":
-		fmt.Fprintln(commandView, "Available commands: connect <addr>, room <name>, bootstrap <addr>, id, peers, status, exit, quit, bye, help")
+		fmt.Fprintln(commandView, "Available commands: connect <addr>, room <name>, bootstrap <addr>, send <path>, id, peers, status, exit, quit, bye, help")
 
 	case "id":
 		fmt.Fprintf(commandView, "[yellow]Share this address with your peer:[-]\n")
@@ -521,7 +587,7 @@ func handleSessionInput(input string) {
 			return
 		}
 
-		available := []string{"connect", "room", "peers", "status", "help", "id", "exit", "quit", "bye", "bootstrap"}
+		available := []string{"connect", "room", "peers", "status", "help", "id", "exit", "quit", "bye", "bootstrap", "send"}
 		resolved, err := resolveCommand(parts[0], available)
 		if err != nil {
 			fmt.Fprintf(commandView, "[red]%s[-]\n", err)
@@ -553,6 +619,49 @@ func handleSessionInput(input string) {
 		return
 	}
 	rw.Flush()
+}
+
+func sendFile(target peer.ID, path string) {
+	file, err := os.Open(path)
+	if err != nil {
+		app.QueueUpdateDraw(func() {
+			fmt.Fprintf(commandView, "[red]Cannot open file: %s[-]\n", err)
+		})
+		return
+	}
+	defer file.Close()
+
+	fi, _ := file.Stat()
+	fileName := filepath.Base(path)
+	fileSize := fi.Size()
+
+	app.QueueUpdateDraw(func() {
+		fmt.Fprintf(commandView, "[yellow][File] Sending '%s' (%d bytes)...[-]\n", fileName, fileSize)
+	})
+
+	s, err := h.NewStream(ctx, target, fileProtocolID)
+	if err != nil {
+		app.QueueUpdateDraw(func() {
+			fmt.Fprintf(commandView, "[red]Failed to open file stream: %s[-]\n", err)
+		})
+		return
+	}
+	defer s.Close()
+
+	// Send header: name\nsize\n
+	header := fmt.Sprintf("%s\n%d\n", fileName, fileSize)
+	s.Write([]byte(header))
+
+	_, err = io.Copy(s, file)
+	if err != nil {
+		app.QueueUpdateDraw(func() {
+			fmt.Fprintf(commandView, "[red]Error during file transfer: %s[-]\n", err)
+		})
+	} else {
+		app.QueueUpdateDraw(func() {
+			fmt.Fprintf(commandView, "[green][File] Transfer of '%s' complete.[-]\n", fileName)
+		})
+	}
 }
 
 // ****************************************************************************
@@ -749,6 +858,11 @@ func loadOrGenerateKey(path string) (crypto.PrivKey, error) {
 		return nil, err
 	}
 	return crypto.UnmarshalPrivateKey(data)
+}
+
+func fileExists(filename string) bool {
+	info, err := os.Stat(filename)
+	return !os.IsNotExist(err) && !info.IsDir()
 }
 
 /*
