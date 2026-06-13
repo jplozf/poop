@@ -1,0 +1,16 @@
+#!/bin/bash
+
+MINOR=$(git rev-list --count HEAD 2>/dev/null || echo "0")
+HASH=$(git rev-parse --short HEAD 2>/dev/null || echo "no-git")
+GIT_STR="${MINOR}-${HASH}"
+
+echo "🔨 Embedding Git version : $GIT_STR"
+
+go build -ldflags "-X 'main.GitVersion=${GIT_STR}'" -o poop
+
+if [ $? -eq 0 ]; then
+    echo "✅ Compilation successful"
+else
+    echo "❌ Compilation in error"
+    exit 1
+fi

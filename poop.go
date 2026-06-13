@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	mrand "math/rand"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -56,6 +57,9 @@ const (
 // VARS
 // ****************************************************************************
 var (
+	appName              = "poop"
+	appMajorVersion      = "0"
+	GitVersion           = "dev"
 	previousStatus       AppState
 	previousActivePeerID peer.ID
 	currentStatus        = StateIdle
@@ -229,7 +233,9 @@ func main() {
 			AddItem(chatView, 0, 1, false), 0, 1, false).
 		AddItem(inputField, 1, 1, true)
 
-	fmt.Fprintln(commandView, "[yellow]Welcome to Poop P2P.[-]")
+	fullVersion := fmt.Sprintf("%s.%s", appMajorVersion, GitVersion)
+	fmt.Fprintf(commandView, "[yellow]Welcome to Poop P2P (v%s).[-]\n", fullVersion)
+	go checkForUpdates()
 
 	// 1. Create the Libp2p Host with NAT traversal capabilities
 	var err error
@@ -1245,6 +1251,45 @@ func loadOrGenerateKey(path string) (crypto.PrivKey, error) {
 func fileExists(filename string) bool {
 	info, err := os.Stat(filename)
 	return !os.IsNotExist(err) && !info.IsDir()
+}
+
+func checkForUpdates() {
+	// Extract the short hash from GitVersion (format: "MINOR-HASH")
+	parts := strings.Split(GitVersion, "-")
+	currentHash := parts[len(parts)-1]
+
+	// Skip check for dev builds or if the version string is empty
+	if currentHash == "dev" || currentHash == "no-git" || currentHash == "" {
+		return
+	}
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	req, err := http.NewRequest("GET", "https://api.github.com/repos/jplozf/poop/commits/HEAD", nil)
+	if err != nil {
+		return
+	}
+	req.Header.Set("User-Agent", "poop-p2p-client")
+	req.Header.Set("Accept", "application/vnd.github.v3+json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+
+	var commit struct {
+		Sha string `json:"sha"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&commit); err != nil {
+		return
+	}
+
+	// If the remote SHA does not start with our local short hash, a new version exists
+	if !strings.HasPrefix(commit.Sha, currentHash) {
+		app.QueueUpdateDraw(func() {
+			fmt.Fprintf(commandView, "[yellow][Update] A newer version is available on GitHub! (Latest: %s)[-]\n", commit.Sha[:7])
+		})
+	}
 }
 
 func generateRandomAlias() string {
