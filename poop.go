@@ -7,6 +7,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/rand"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -188,9 +189,30 @@ func main() {
 		SetLabel("> ").
 		SetFieldWidth(0)
 
-	// Initialize global alias with a random identifier
-	mrand.Seed(time.Now().UnixNano())
-	myAlias = fmt.Sprintf("Pooper-%04d", mrand.Intn(10000))
+	// Initialize directories
+	homeDir, erd := os.UserHomeDir()
+	if erd != nil {
+		panic(fmt.Sprintf("Failed to get user home directory: %v", erd))
+	}
+	incomingDir = filepath.Join(homeDir, ".poop", "incoming")
+	os.MkdirAll(incomingDir, 0755)
+
+	// Try to load alias from config.json
+	configPath := filepath.Join(homeDir, ".poop", "config.json")
+	if data, err := os.ReadFile(configPath); err == nil {
+		var cfg struct {
+			Alias string `json:"alias"`
+		}
+		if err := json.Unmarshal(data, &cfg); err == nil && cfg.Alias != "" {
+			myAlias = cfg.Alias
+		}
+	}
+
+	if myAlias == "" {
+		mrand.Seed(time.Now().UnixNano())
+		myAlias = fmt.Sprintf("Pooper-%04d", mrand.Intn(10000))
+	}
+	chatView.SetTitle(fmt.Sprintf(" Chat Session (as %s) ", myAlias))
 
 	setupInputHandlers()
 
@@ -206,14 +228,6 @@ func main() {
 		AddItem(inputField, 1, 1, true)
 
 	fmt.Fprintln(commandView, "[yellow]Welcome to Poop P2P.[-]")
-
-	// Initialize incoming directory
-	homeDir, erd := os.UserHomeDir()
-	if erd != nil {
-		panic(fmt.Sprintf("Failed to get user home directory: %v", erd))
-	}
-	incomingDir = filepath.Join(homeDir, ".poop", "incoming")
-	os.MkdirAll(incomingDir, 0755) // Create if not exists
 
 	// 1. Create the Libp2p Host with NAT traversal capabilities
 	var err error
