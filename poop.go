@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	mrand "math/rand"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -54,21 +55,40 @@ const (
 // VARS
 // ****************************************************************************
 var (
-	currentStatus = StateIdle
-	pendingStream network.Stream
-	incomingDir   string
-	historyFile   = filepath.Join(os.TempDir(), ".poop_history")
-	ctx           = context.Background()
-	h             host.Host
-	kademliaDHT   *dht.IpfsDHT
+	previousStatus       AppState
+	previousActivePeerID peer.ID
+	currentStatus        = StateIdle
+	// sessions stores active chat sessions.
+	// Each entry contains the network.Stream and its associated bufio.ReadWriter
+	// to ensure consistent buffering and avoid read/write conflicts.
+	sessions = make(map[peer.ID]struct {
+		Stream network.Stream
+		RW     *bufio.ReadWriter
+	})
+	activePeerID   peer.ID                    // The peer currently shown in the chat window
+	sessionBuffers = make(map[peer.ID]string) // Stores history for background chats
+	peerAliases    = make(map[peer.ID]string) // Stores aliases for peers
+	myAlias        string                     // Our global alias
+
+	// Specifically for the auth flow
+	authStream network.Stream
+	authChan   chan string // Used to communicate choice and alias to the handler
+	sessionMu  sync.RWMutex
+
+	incomingDir string
+	historyFile = filepath.Join(os.TempDir(), ".poop_history")
+	ctx         = context.Background()
+	h           host.Host
+	kademliaDHT *dht.IpfsDHT
 
 	// UI Components
-	app         *tview.Application
-	commandView *tview.TextView
-	chatView    *tview.TextView
-	inputField  *tview.InputField
-	history     []string
-	historyIdx  = -1
+	app             *tview.Application
+	commandView     *tview.TextView
+	chatView        *tview.TextView
+	sessionListView *tview.TextView
+	inputField      *tview.InputField
+	history         []string
+	historyIdx      = -1
 
 	discoveredPeers []peer.ID
 	peerMu          sync.Mutex
@@ -148,7 +168,6 @@ func main() {
 		SetWordWrap(true).
 		SetChangedFunc(func() {
 			commandView.ScrollToEnd()
-			app.Draw()
 		})
 	commandView.SetBorder(true).SetTitle(" System & Commands ")
 
@@ -157,20 +176,32 @@ func main() {
 		SetWordWrap(true).
 		SetChangedFunc(func() {
 			chatView.ScrollToEnd()
-			app.Draw()
 		})
 	chatView.SetBorder(true).SetTitle(" Chat Session ")
+
+	sessionListView = tview.NewTextView().
+		SetDynamicColors(true).
+		SetWordWrap(true)
+	sessionListView.SetBorder(true).SetTitle(" Active Sessions ")
 
 	inputField = tview.NewInputField().
 		SetLabel("> ").
 		SetFieldWidth(0)
 
+	// Initialize global alias with a random identifier
+	mrand.Seed(time.Now().UnixNano())
+	myAlias = fmt.Sprintf("Pooper-%04d", mrand.Intn(10000))
+
 	setupInputHandlers()
 
-	// Layout: Top row (Command | Chat), Bottom row (Input)
+	// Layout: Left column (Command | Sessions), Right column (Chat), Bottom row (Input)
+	leftFlex := tview.NewFlex().SetDirection(tview.FlexRow).
+		AddItem(commandView, 0, 2, false).
+		AddItem(sessionListView, 0, 1, false)
+
 	mainFlex := tview.NewFlex().SetDirection(tview.FlexRow).
 		AddItem(tview.NewFlex().
-			AddItem(commandView, 0, 1, false).
+			AddItem(leftFlex, 0, 1, false).
 			AddItem(chatView, 0, 1, false), 0, 1, false).
 		AddItem(inputField, 1, 1, true)
 
@@ -254,7 +285,7 @@ func main() {
 		idx := registerPeer(s.Conn().RemotePeer())
 		content := strings.TrimSpace(str)
 		app.QueueUpdateDraw(func() {
-			fmt.Fprintf(chatView, "[yellow]%s[-]: %s\n", tview.Escape(fmt.Sprintf("[$%d]", idx)), content)
+			fmt.Fprintf(chatView, "[yellow]%s[-]: %s\n", tview.Escape(fmt.Sprintf("[$%d>me]", idx)), content)
 		})
 		s.Close()
 	})
@@ -304,19 +335,105 @@ func main() {
 	})
 
 	h.SetStreamHandler("/poop/auth/1.0.0", func(s network.Stream) {
-		if currentStatus != StateIdle {
-			s.Write([]byte("REJECT_BUSY\n"))
+		// Create a buffered reader/writer for the incoming stream
+		rw := bufio.NewReadWriter(bufio.NewReader(s), bufio.NewWriter(s))
+		remoteID := s.Conn().RemotePeer()
+		idx := registerPeer(remoteID)
+
+		// Read the initial message from the initiator to unblock them
+		initialMsg, err := rw.ReadString('\n')
+		if err != nil {
+			app.QueueUpdateDraw(func() {
+				fmt.Fprintf(commandView, "[red]Error reading initial auth message from %s: %s[-]\n", s.Conn().RemotePeer(), err)
+			})
 			s.Close()
 			return
 		}
 
-		pendingStream = s
+		parts := strings.SplitN(strings.TrimSpace(initialMsg), " ", 2)
+		if parts[0] != "SESSION_REQUEST" {
+			rw.WriteString("REJECT_BAD_PROTOCOL\n")
+			rw.Flush()
+			s.Close()
+			return
+		}
+
+		remoteAlias := "Unknown"
+		if len(parts) > 1 {
+			remoteAlias = parts[1]
+		}
+
+		sessionMu.Lock()
+		if authStream != nil { // Another auth is already pending
+			sessionMu.Unlock()
+			s.Reset()
+			app.QueueUpdateDraw(func() {
+				fmt.Fprintf(commandView, "[yellow][Discovery] Busy: rejected incoming session from %s[-]\n", remoteID)
+			})
+			rw.WriteString("REJECT_BUSY\n") // Use rw to send rejection
+			rw.Flush()
+			s.Close()
+			return
+		}
+		// Store current state before changing to AwaitingAuth
+		previousStatus = currentStatus
+		previousActivePeerID = activePeerID
+		authStream = s
 		currentStatus = StateAwaitingAuth
+		authChan = make(chan string, 2) // Buffered to prevent blocking the UI thread
+		sessionMu.Unlock()
 
 		app.QueueUpdateDraw(func() {
-			fmt.Fprintf(commandView, "[yellow][!!!] Incoming session from %s[-]\n", s.Conn().RemotePeer())
-			inputField.SetLabel("Accept ? (y/n): ")
+			fmt.Fprintf(commandView, "[yellow][!!!] Incoming session from '%s' (as $%d) %s[-]\n", remoteAlias, idx, remoteID)
+			inputField.SetLabel("Accept incoming? (y/n): ")
 		})
+
+		// Wait for user input from the main UI thread via authChan
+		signal, ok := <-authChan
+		if !ok || signal != "Y" {
+			rw.WriteString("REJECT\n")
+			rw.Flush()
+			s.Close()
+
+			sessionMu.Lock()
+			currentStatus = previousStatus
+			activePeerID = previousActivePeerID
+			sessionMu.Unlock()
+
+			app.QueueUpdateDraw(func() {
+				fmt.Fprintln(commandView, "[yellow]Incoming connection declined.[-]")
+				restoreUILabel()
+			})
+			go updateSessionList()
+			return
+		}
+
+		sessionMu.Lock()
+		authChan = nil // Clear early to prevent UI thread from blocking on double-input
+		authStream = nil
+		sessionMu.Unlock()
+
+		// User accepted: Send ACK with our global alias
+		rw.WriteString(fmt.Sprintf("ACK %s\n", myAlias))
+		rw.Flush()
+
+		sessionMu.Lock()
+		peerAliases[remoteID] = remoteAlias
+		sessions[remoteID] = struct {
+			Stream network.Stream
+			RW     *bufio.ReadWriter
+		}{Stream: s, RW: rw}
+		activePeerID = remoteID
+		currentStatus = StateInSession
+		sessionMu.Unlock()
+
+		app.QueueUpdateDraw(func() {
+			inputField.SetLabel(fmt.Sprintf("[Chatting with $%d]: ", idx))
+			fmt.Fprintf(commandView, "[green]--- Session Started with %s ($%d) ---[-]\n", remoteAlias, idx)
+			chatView.SetText("")
+		})
+		go updateSessionList()
+		runChatLoop(remoteID)
 	})
 
 	// 3. Print local info so others can connect to us
@@ -364,30 +481,42 @@ func setupInputHandlers() {
 		if key != tcell.KeyEnter {
 			return
 		}
-		line := inputField.GetText()
-		if len(line) == 0 {
+		line := strings.TrimSpace(inputField.GetText())
+
+		// Add to history if it's not empty and different from the last entry
+		if len(line) > 0 {
+			if len(history) == 0 || history[len(history)-1] != line {
+				history = append(history, line)
+			}
+		}
+		historyIdx = -1
+		inputField.SetText("")
+
+		sessionMu.RLock()
+		status := currentStatus
+		sessionMu.RUnlock()
+
+		// Allow empty lines in auth states to prevent the UI from getting "stuck"
+		// if the user just hits Enter.
+		if len(line) == 0 && status != StateAwaitingAuth {
 			return
 		}
 
-		// Add to history if it's different from the last entry
-		if len(history) == 0 || history[len(history)-1] != line {
-			history = append(history, line)
-		}
-		historyIdx = -1
-
-		inputField.SetText("")
-
-		switch currentStatus {
+		switch status {
 		case StateAwaitingAuth:
 			handleAuthInput(line)
 		case StateInSession:
-			handleSessionInput(line)
-		case StateIdle:
-			processedLine := line
-			if strings.HasPrefix(line, "/") {
-				processedLine = strings.TrimPrefix(line, "/")
+			if len(line) > 0 {
+				handleSessionInput(line)
 			}
-			handleCommandInput(processedLine, h)
+		case StateIdle:
+			if len(line) > 0 {
+				processedLine := line
+				if strings.HasPrefix(line, "/") {
+					processedLine = strings.TrimPrefix(line, "/")
+				}
+				handleCommandInput(processedLine, h)
+			}
 		}
 	})
 }
@@ -396,72 +525,109 @@ func setupInputHandlers() {
 // startSession()
 // ****************************************************************************
 func startSession(ctx context.Context, h host.Host, target string) {
-	var info *peer.AddrInfo
+	// Run the connection logic in a goroutine to avoid freezing the UI thread
+	go func() {
+		var info *peer.AddrInfo
 
-	// 1. Try to parse as a full Multiaddr first (contains both ID and Network Addr)
-	if maddr, err := multiaddr.NewMultiaddr(target); err == nil {
-		info, err = peer.AddrInfoFromP2pAddr(maddr)
+		// 1. Try to parse as a full Multiaddr first
+		if maddr, err := multiaddr.NewMultiaddr(target); err == nil {
+			info, err = peer.AddrInfoFromP2pAddr(maddr)
+			if err != nil {
+				fmt.Fprintf(commandView, "[red]Could not get peer info from multiaddr: %s[-]\n", err)
+				return
+			}
+		} else {
+			// 2. If it's not a multiaddr, try parsing as a Peer ID string
+			id, err := peer.Decode(target)
+			if err != nil {
+				app.QueueUpdateDraw(func() {
+					fmt.Fprintf(commandView, "[red]Input is not a valid Multiaddr or Peer ID: %s[-]\n", err)
+				})
+				return
+			}
+
+			knownAddrs := h.Peerstore().Addrs(id)
+			if len(knownAddrs) == 0 {
+				app.QueueUpdateDraw(func() {
+					fmt.Fprintf(commandView, "[red]No known addresses for peer %s. Try using a full multiaddr.[-]\n", id)
+				})
+				return
+			}
+			info = &peer.AddrInfo{ID: id, Addrs: knownAddrs}
+		}
+
+		// 3. Connect to the peer
+		app.QueueUpdateDraw(func() {
+			fmt.Fprintf(commandView, "Attempting to connect to %s...\n", info.ID)
+		})
+
+		if err := h.Connect(ctx, *info); err != nil {
+			app.QueueUpdateDraw(func() {
+				fmt.Fprintf(commandView, "[red]Connection failed: %s[-]\n", err)
+			})
+			return
+		}
+
+		// 4. Open the 'Poop' protocol stream
+		s, err := h.NewStream(ctx, info.ID, "/poop/auth/1.0.0")
 		if err != nil {
-			fmt.Fprintf(commandView, "[red]Could not get peer info from multiaddr: %s[-]\n", err)
+			app.QueueUpdateDraw(func() {
+				fmt.Fprintf(commandView, "[red]Protocol error: %s[-]\n", err)
+			})
 			return
 		}
-	} else {
-		// 2. If it's not a multiaddr, try parsing as a Peer ID string
-		id, err := peer.Decode(target)
+
+		rw := bufio.NewReadWriter(bufio.NewReader(s), bufio.NewWriter(s))
+		idx := registerPeer(info.ID)
+		app.QueueUpdateDraw(func() {
+			fmt.Fprintln(commandView, "Waiting for peer to accept the session...")
+		})
+
+		// We send a tiny 'knock' message
+		rw.WriteString(fmt.Sprintf("SESSION_REQUEST %s\n", myAlias))
+		rw.Flush()
+
+		reply, err := rw.ReadString('\n')
 		if err != nil {
-			fmt.Fprintf(commandView, "[red]Input is not a valid Multiaddr or Peer ID: %s[-]\n", err)
+			app.QueueUpdateDraw(func() {
+				fmt.Fprintln(commandView, "[red]Peer closed the connection.[-]")
+			})
+			s.Close()
 			return
 		}
 
-		// Check the Peerstore for addresses associated with this ID.
-		// These are populated automatically by mDNS and DHT discovery.
-		knownAddrs := h.Peerstore().Addrs(id)
-		if len(knownAddrs) == 0 {
-			fmt.Fprintf(commandView, "[red]No known addresses for peer %s. Try using a full multiaddr.[-]\n", id)
-			return
+		reply = strings.TrimSpace(reply)
+		if strings.HasPrefix(reply, "ACK") {
+			alias := ""
+			parts := strings.SplitN(reply, " ", 2)
+			if len(parts) > 1 {
+				alias = parts[1]
+			}
+
+			app.QueueUpdateDraw(func() {
+				fmt.Fprintln(commandView, "[green]Success! Peer accepted the session.[-]")
+				sessionMu.Lock()
+				if alias != "" {
+					peerAliases[info.ID] = alias
+				}
+				sessions[info.ID] = struct {
+					Stream network.Stream
+					RW     *bufio.ReadWriter
+				}{Stream: s, RW: rw}
+				activePeerID = info.ID
+				currentStatus = StateInSession
+				sessionMu.Unlock()
+				inputField.SetLabel(fmt.Sprintf("[Chatting with $%d]: ", idx))
+			})
+			go updateSessionList()
+			runChatLoop(info.ID) // Pass peer ID
+		} else {
+			app.QueueUpdateDraw(func() {
+				fmt.Fprintln(commandView, "[red]Peer rejected the session request.[-]")
+			})
+			s.Close()
 		}
-		info = &peer.AddrInfo{ID: id, Addrs: knownAddrs}
-	}
-
-	// 3. Connect to the peer
-	fmt.Fprintf(commandView, "Attempting to connect to %s...\n", info.ID)
-	if err := h.Connect(ctx, *info); err != nil {
-		fmt.Fprintf(commandView, "[red]Connection failed: %s[-]\n", err)
-		return
-	}
-
-	// 4. Open the 'Poop' protocol stream
-	s, err := h.NewStream(ctx, info.ID, "/poop/auth/1.0.0")
-	if err != nil {
-		fmt.Fprintf(commandView, "[red]Protocol error: %s[-]\n", err)
-		return
-	}
-
-	// 5. Wait for the ACK/REJECT
-	rw := bufio.NewReadWriter(bufio.NewReader(s), bufio.NewWriter(s))
-	fmt.Fprintln(commandView, "Waiting for peer to accept the session...")
-
-	// We send a tiny 'knock' message
-	rw.WriteString("SESSION_REQUEST\n")
-	rw.Flush()
-
-	reply, err := rw.ReadString('\n')
-	if err != nil {
-		fmt.Fprintln(commandView, "[red]Peer closed the connection.[-]")
-		s.Close()
-		return
-	}
-
-	if strings.TrimSpace(reply) == "ACK" {
-		fmt.Fprintln(commandView, "[green]Success! Peer accepted the session.[-]")
-		inputField.SetLabel("[SESSION]: ")
-		pendingStream = s
-		currentStatus = StateInSession
-		startReadLoop(pendingStream)
-	} else {
-		fmt.Fprintln(commandView, "[red]Peer rejected the session request.[-]")
-		s.Close()
-	}
+	}()
 }
 
 // ****************************************************************************
@@ -473,7 +639,7 @@ func handleCommandInput(input string, h host.Host) {
 		return
 	}
 
-	available := []string{"connect", "room", "peers", "status", "help", "id", "exit", "quit", "bye", "bootstrap", "send"}
+	available := []string{"connect", "room", "peers", "status", "help", "id", "exit", "quit", "bye", "bootstrap", "send", "chat"}
 	resolved, err := resolveCommand(parts[0], available)
 	if err != nil {
 		fmt.Fprintf(commandView, "[red]%s[-]. Type 'help' for info.\n", err)
@@ -502,6 +668,43 @@ func handleCommandInput(input string, h host.Host) {
 		}
 
 		startSession(context.Background(), h, targetAddr)
+
+	case "chat":
+		if len(parts) < 2 {
+			fmt.Fprintln(commandView, "Usage: chat <$index>")
+			return
+		}
+		idx, err := strconv.Atoi(strings.TrimPrefix(parts[1], "$"))
+		if err != nil || idx <= 0 {
+			fmt.Fprintln(commandView, "[red]Invalid index.[-]")
+			return
+		}
+
+		peerMu.Lock()
+		if idx > len(discoveredPeers) {
+			fmt.Fprintln(commandView, "[red]Peer not found.[-]")
+			peerMu.Unlock()
+			return
+		}
+		targetID := discoveredPeers[idx-1]
+		peerMu.Unlock()
+
+		var success bool
+		sessionMu.RLock()
+		if _, ok := sessions[targetID]; ok {
+			activePeerID = targetID
+			currentStatus = StateInSession
+			inputField.SetLabel(fmt.Sprintf("[Chatting with $%d]: ", idx))
+			chatView.SetText(sessionBuffers[targetID])
+			success = true
+		} else {
+			fmt.Fprintf(commandView, "[red]No active session with $%d. Use 'connect' first.[-]\n", idx)
+		}
+		sessionMu.RUnlock()
+
+		if success {
+			go updateSessionList()
+		}
 
 	case "room":
 		if len(parts) < 2 {
@@ -541,12 +744,15 @@ func handleCommandInput(input string, h host.Host) {
 			fmt.Fprintf(commandView, "[red]Error getting peer info: %s[-]\n", err)
 			return
 		}
-		if err := h.Connect(ctx, *peerinfo); err != nil {
-			fmt.Fprintf(commandView, "[red]Failed to connect to bootstrap node: %s[-]\n", err)
-		} else {
-			fmt.Fprintf(commandView, "[green]Connected to bootstrap node: %s[-]\n", peerinfo.ID)
-			kademliaDHT.Bootstrap(ctx)
-		}
+
+		go func() {
+			if err := h.Connect(ctx, *peerinfo); err != nil {
+				app.QueueUpdateDraw(func() { fmt.Fprintf(commandView, "[red]Failed to connect to bootstrap node: %s[-]\n", err) })
+			} else {
+				app.QueueUpdateDraw(func() { fmt.Fprintf(commandView, "[green]Connected to bootstrap node: %s[-]\n", peerinfo.ID) })
+				kademliaDHT.Bootstrap(ctx)
+			}
+		}()
 
 	case "send":
 		if currentStatus != StateInSession {
@@ -557,7 +763,11 @@ func handleCommandInput(input string, h host.Host) {
 			fmt.Fprintln(commandView, "Usage: /send <filepath>")
 			return
 		}
-		go sendFile(pendingStream.Conn().RemotePeer(), parts[1])
+		sessionMu.RLock()
+		if _, ok := sessions[activePeerID]; ok {
+			go sendFile(activePeerID, parts[1])
+		}
+		sessionMu.RUnlock()
 
 	case "help":
 		fmt.Fprintln(commandView, "Available commands: connect <addr>, room <name>, bootstrap <addr>, send <path>, id, peers, status, exit, quit, bye, help")
@@ -587,7 +797,7 @@ func handleSessionInput(input string) {
 			return
 		}
 
-		available := []string{"connect", "room", "peers", "status", "help", "id", "exit", "quit", "bye", "bootstrap", "send"}
+		available := []string{"connect", "room", "peers", "status", "help", "id", "exit", "quit", "bye", "bootstrap", "send", "chat"}
 		resolved, err := resolveCommand(parts[0], available)
 		if err != nil {
 			fmt.Fprintf(commandView, "[red]%s[-]\n", err)
@@ -595,10 +805,18 @@ func handleSessionInput(input string) {
 		}
 
 		if resolved == "quit" {
-			fmt.Fprintln(commandView, "Closing session...")
-			pendingStream.Close()
+			sessionMu.Lock()
+			if sessionEntry, ok := sessions[activePeerID]; ok {
+				sessionEntry.Stream.Close() // Close the stream
+				delete(sessions, activePeerID)
+			}
+			sessionMu.Unlock()
+
+			fmt.Fprintln(commandView, "Session closed.")
 			currentStatus = StateIdle
 			inputField.SetLabel("> ")
+			chatView.SetText("")
+			go updateSessionList()
 			return
 		}
 		// Forward other commands (like /status or /help) to the command handler
@@ -606,19 +824,42 @@ func handleSessionInput(input string) {
 		return
 	}
 
-	fmt.Fprintf(chatView, "[blue]%s[-]: %s\n", tview.Escape("[me]"), input)
+	sessionMu.RLock() // <--- RLock to get stream and rw
+	sessionEntry, ok := sessions[activePeerID]
+	sessionMu.RUnlock()
 
-	// We use the 'pendingStream' we saved earlier during the ACK
-	rw := bufio.NewReadWriter(bufio.NewReader(pendingStream), bufio.NewWriter(pendingStream))
-
-	// Send the message to the peer
-	if _, err := rw.WriteString(input + "\n"); err != nil {
-		fmt.Fprintf(commandView, "[red]Error sending message: %s[-]\n", err)
-		currentStatus = StateIdle
-		inputField.SetLabel("> ")
+	if !ok {
+		fmt.Fprintln(commandView, "[red]Error: No active session selected.[-]")
 		return
 	}
-	rw.Flush()
+
+	rw := sessionEntry.RW // Use the stored ReadWriter
+
+	// Send the message to the peer in a goroutine to avoid freezing the UI thread if the network buffer is full
+	go func(msg string, target peer.ID) {
+		if _, err := rw.WriteString(msg + "\n"); err != nil {
+			app.QueueUpdateDraw(func() {
+				fmt.Fprintf(commandView, "[red]Error sending message to %s: %s[-]\n", target, err)
+			})
+			return
+		}
+		rw.Flush()
+	}(input, activePeerID)
+
+	sessionMu.RLock()
+	targetName := peerAliases[activePeerID]
+	sessionMu.RUnlock()
+
+	idx := registerPeer(activePeerID)
+	if targetName == "" {
+		targetName = fmt.Sprintf("$%d", idx)
+	}
+
+	msg := fmt.Sprintf("[blue]%s[-]: %s\n", tview.Escape(fmt.Sprintf("[me>%s]", targetName)), input)
+	sessionMu.Lock()
+	sessionBuffers[activePeerID] += msg
+	sessionMu.Unlock()
+	fmt.Fprint(chatView, msg)
 }
 
 func sendFile(target peer.ID, path string) {
@@ -668,46 +909,144 @@ func sendFile(target peer.ID, path string) {
 // handleAuthInput()
 // ****************************************************************************
 func handleAuthInput(input string) {
-	rw := bufio.NewReadWriter(bufio.NewReader(pendingStream), bufio.NewWriter(pendingStream))
+	sessionMu.RLock()
+	ch := authChan
+	sessionMu.RUnlock()
 
-	if strings.ToLower(input) == "y" {
-		rw.WriteString("ACK\n")
-		rw.Flush()
-		currentStatus = StateInSession
-		inputField.SetLabel("[SESSION]: ")
-		fmt.Fprintln(commandView, "[green]--- Session Started ---[-]")
-		startReadLoop(pendingStream)
-	} else {
-		rw.WriteString("REJECT\n")
-		rw.Flush()
-		pendingStream.Close()
-		currentStatus = StateIdle
-		inputField.SetLabel("> ")
-		fmt.Fprintln(commandView, "Connection declined.")
+	if ch == nil {
+		return
+	}
+
+	line := strings.TrimSpace(input)
+	signal := "N"
+	if strings.ToLower(line) == "y" {
+		signal = "Y"
+	}
+
+	select {
+	case ch <- signal:
+	default:
+	}
+
+	if signal == "N" {
+		restoreUILabel()
 	}
 }
 
-// ****************************************************************************
-// startReadLoop()
-// ****************************************************************************
-func startReadLoop(s network.Stream) {
-	go func() {
-		scanner := bufio.NewScanner(s)
-		idx := registerPeer(s.Conn().RemotePeer())
-		for scanner.Scan() {
-			msg := scanner.Text()
-			app.QueueUpdateDraw(func() {
-				fmt.Fprintf(chatView, "[yellow]%s[-]: %s\n", tview.Escape(fmt.Sprintf("[$%d]", idx)), msg)
-			})
+func restoreUILabel() {
+	app.QueueUpdateDraw(func() {
+		sessionMu.RLock()
+		peerID := activePeerID
+		sessionMu.RUnlock()
+
+		idx := 0
+		if peerID != "" {
+			idx = registerPeer(peerID)
 		}
-		if err := scanner.Err(); err != nil {
-			app.QueueUpdateDraw(func() {
-				fmt.Fprintln(commandView, "[red][!] Connection lost.[-]")
-				currentStatus = StateIdle
-				inputField.SetLabel("> ")
-			})
+
+		if currentStatus == StateInSession {
+			inputField.SetLabel(fmt.Sprintf("[Chatting with $%d]: ", idx))
+		} else {
+			inputField.SetLabel("> ")
 		}
-	}()
+	})
+}
+
+// ****************************************************************************
+// runChatLoop()
+// ****************************************************************************
+func runChatLoop(remoteID peer.ID) {
+	sessionMu.RLock()
+	sessionEntry, ok := sessions[remoteID]
+	sessionMu.RUnlock()
+	if !ok {
+		return // Session no longer exists (e.g., closed by /quit command)
+	}
+	s, rw := sessionEntry.Stream, sessionEntry.RW
+	idx := registerPeer(remoteID)
+	for {
+		// Use the existing Reader to avoid losing data already in the buffer
+		msg, err := rw.ReadString('\n')
+		if err != nil {
+			break
+		}
+
+		sessionMu.RLock()
+		senderName := peerAliases[remoteID]
+		sessionMu.RUnlock()
+		if senderName == "" {
+			senderName = fmt.Sprintf("$%d", idx)
+		}
+
+		msg = strings.TrimSpace(msg)
+		formatted := fmt.Sprintf("[yellow]%s[-]: %s\n", tview.Escape(fmt.Sprintf("[%s>me]", senderName)), msg)
+
+		sessionMu.Lock()
+		sessionBuffers[remoteID] += formatted
+		sessionMu.Unlock()
+
+		app.QueueUpdateDraw(func() {
+			if activePeerID == remoteID {
+				fmt.Fprint(chatView, formatted)
+			}
+		})
+	}
+
+	sessionMu.Lock()
+	delete(sessions, remoteID)
+	sessionMu.Unlock()
+	updateSessionList()
+
+	sessionMu.RLock()
+	isActive := activePeerID == remoteID
+	sessionMu.RUnlock()
+
+	if isActive {
+		app.QueueUpdateDraw(func() {
+			fmt.Fprintln(commandView, "[red][!] Connection lost.[-]")
+			currentStatus = StateIdle
+			inputField.SetLabel("> ")
+		})
+	}
+	s.Close()
+}
+
+func updateSessionList() {
+	if sessionListView == nil {
+		return
+	}
+
+	// Snapshot the peers first to avoid holding peerMu while taking sessionMu (Deadlock Prevention)
+	peerMu.Lock()
+	peers := make([]peer.ID, len(discoveredPeers))
+	copy(peers, discoveredPeers)
+	peerMu.Unlock()
+
+	sb := new(strings.Builder)
+	sessionMu.RLock()
+	currActive := activePeerID
+	currStatus := currentStatus
+
+	for i, id := range peers {
+		if _, exists := sessions[id]; exists {
+			displayName := id.String()
+			if alias, ok := peerAliases[id]; ok && alias != "" {
+				displayName = alias
+			}
+
+			indicator := "  "
+			if id == currActive && currStatus == StateInSession {
+				indicator = "[green]* [-]"
+			}
+			fmt.Fprintf(sb, "%s[$%d]> %s\n", indicator, i+1, displayName)
+		}
+	}
+	sessionMu.RUnlock()
+
+	newText := sb.String()
+	app.QueueUpdateDraw(func() {
+		sessionListView.SetText(newText)
+	})
 }
 
 // discoverPeers handles the Rendezvous logic
