@@ -223,20 +223,46 @@ func main() {
 
 	setupInputHandlers()
 
+	// 1. Create Title Bar Components
+	titleDate := tview.NewTextView().SetDynamicColors(true).SetTextAlign(tview.AlignLeft)
+	titleVersion := tview.NewTextView().SetDynamicColors(true).SetTextAlign(tview.AlignCenter)
+	titleTime := tview.NewTextView().SetDynamicColors(true).SetTextAlign(tview.AlignRight)
+
+	titleBar := tview.NewFlex().
+		AddItem(titleDate, 0, 1, false).
+		AddItem(titleVersion, 0, 2, false).
+		AddItem(titleTime, 0, 1, false)
+
+	fullVersion := fmt.Sprintf("%s.%s", appMajorVersion, GitVersion)
+	titleVersion.SetText(fmt.Sprintf("[white]Poop v%s[-]", fullVersion))
+
+	// 2. Start clock goroutine for real-time updates
+	go func() {
+		for {
+			now := time.Now()
+			app.QueueUpdateDraw(func() {
+				titleDate.SetText(now.Format(" [yellow]2006-01-02[-]"))
+				titleTime.SetText(now.Format("[yellow]15:04:05[-] "))
+			})
+			time.Sleep(1 * time.Second)
+		}
+	}()
+
 	// Layout: Left column (Command | Sessions), Right column (Chat), Bottom row (Input)
 	leftFlex := tview.NewFlex().SetDirection(tview.FlexRow).
 		AddItem(commandView, 0, 2, false).
 		AddItem(sessionListView, 0, 1, false)
 
 	mainFlex := tview.NewFlex().SetDirection(tview.FlexRow).
+		AddItem(titleBar, 1, 1, false).
 		AddItem(tview.NewFlex().
 			AddItem(leftFlex, 0, 1, false).
 			AddItem(chatView, 0, 1, false), 0, 1, false).
 		AddItem(inputField, 1, 1, true)
 
-	fullVersion := fmt.Sprintf("%s.%s", appMajorVersion, GitVersion)
 	fmt.Fprintf(commandView, "[yellow]Welcome to Poop v%s[-]\n", fullVersion)
 	fmt.Fprintf(commandView, "Please, type 'help' for info.\n")
+	fmt.Fprintf(commandView, "Please, press F2 to switch focus.\n")
 	go checkForUpdates()
 
 	// 1. Create the Libp2p Host with NAT traversal capabilities
@@ -474,6 +500,26 @@ func main() {
 }
 
 func setupInputHandlers() {
+	app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyF2 {
+			current := app.GetFocus()
+			switch current {
+			case inputField:
+				app.SetFocus(sessionListView)
+			case sessionListView:
+				app.SetFocus(commandView)
+			case commandView:
+				app.SetFocus(chatView)
+			case chatView:
+				app.SetFocus(inputField)
+			default:
+				app.SetFocus(inputField)
+			}
+			return nil
+		}
+		return event
+	})
+
 	inputField.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		switch event.Key() {
 		case tcell.KeyUp:
@@ -1302,8 +1348,12 @@ func checkForUpdates() {
 	// If the remote SHA does not start with our local short hash, a new version exists
 	if !strings.HasPrefix(commit.Sha, currentHash) {
 		app.QueueUpdateDraw(func() {
-			fmt.Fprintf(commandView, "[yellow]A newer version is available on GitHub ! (Latest: %s)[-]\n", commit.Sha[:7])
+			fmt.Fprintf(commandView, "[yellow]A newer version is available on GitHub ! (Latest : %s)[-]\n", commit.Sha[:7])
 			fmt.Fprintf(commandView, "[yellow]Please visit %s to download the latest version.[-]\n", appURL)
+		})
+	} else {
+		app.QueueUpdateDraw(func() {
+			fmt.Fprintf(commandView, "[green]You are running the latest version : %s.%s[-]\n", appMajorVersion, GitVersion)
 		})
 	}
 }
