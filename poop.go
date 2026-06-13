@@ -76,6 +76,7 @@ var (
 	authChan   chan string // Used to communicate choice and alias to the handler
 	sessionMu  sync.RWMutex
 
+	configPath  string
 	incomingDir string
 	historyFile = filepath.Join(os.TempDir(), ".poop_history")
 	ctx         = context.Background()
@@ -197,8 +198,10 @@ func main() {
 	incomingDir = filepath.Join(homeDir, ".poop", "incoming")
 	os.MkdirAll(incomingDir, 0755)
 
+	mrand.Seed(time.Now().UnixNano())
+
 	// Try to load alias from config.json
-	configPath := filepath.Join(homeDir, ".poop", "config.json")
+	configPath = filepath.Join(homeDir, ".poop", "config.json")
 	if data, err := os.ReadFile(configPath); err == nil {
 		var cfg struct {
 			Alias string `json:"alias"`
@@ -209,8 +212,7 @@ func main() {
 	}
 
 	if myAlias == "" {
-		mrand.Seed(time.Now().UnixNano())
-		myAlias = fmt.Sprintf("Pooper-%04d", mrand.Intn(10000))
+		myAlias = generateRandomAlias()
 	}
 	chatView.SetTitle(fmt.Sprintf(" Chat Session (as %s) ", myAlias))
 
@@ -653,7 +655,7 @@ func handleCommandInput(input string, h host.Host) {
 		return
 	}
 
-	available := []string{"connect", "room", "peers", "status", "help", "id", "exit", "quit", "bye", "bootstrap", "send", "chat"}
+	available := []string{"connect", "room", "peers", "status", "help", "id", "exit", "quit", "bye", "bootstrap", "send", "chat", "alias", "unset"}
 	resolved, err := resolveCommand(parts[0], available)
 	if err != nil {
 		fmt.Fprintf(commandView, "[red]%s[-]. Type 'help' for info.\n", err)
@@ -784,12 +786,39 @@ func handleCommandInput(input string, h host.Host) {
 		sessionMu.RUnlock()
 
 	case "help":
-		fmt.Fprintln(commandView, "Available commands: connect <addr>, room <name>, bootstrap <addr>, send <path>, id, peers, status, exit, quit, bye, help")
+		fmt.Fprintln(commandView, "Available commands: connect <addr>, room <name>, bootstrap <addr>, send <path>, alias <name>, unset alias, id, peers, status, exit, quit, bye, help")
 
 	case "id":
 		fmt.Fprintf(commandView, "[yellow]Share this address with your peer:[-]\n")
 		addr := h.Addrs()[0] // Use the first available addr
 		fmt.Fprintf(commandView, "[white]%s/p2p/%s[-]\n", addr, h.ID())
+
+	case "alias":
+		if len(parts) < 2 {
+			fmt.Fprintln(commandView, "Usage: alias <name>")
+			return
+		}
+		newAlias := parts[1]
+		myAlias = newAlias
+		chatView.SetTitle(fmt.Sprintf(" Chat Session (as %s) ", myAlias))
+		if err := saveAliasConfig(newAlias); err != nil {
+			fmt.Fprintf(commandView, "[red]Failed to save alias: %s[-]\n", err)
+		} else {
+			fmt.Fprintf(commandView, "[green]Alias updated to: %s[-]\n", newAlias)
+		}
+
+	case "unset":
+		if len(parts) < 2 || parts[1] != "alias" {
+			fmt.Fprintln(commandView, "Usage: unset alias")
+			return
+		}
+		myAlias = generateRandomAlias()
+		chatView.SetTitle(fmt.Sprintf(" Chat Session (as %s) ", myAlias))
+		if err := os.Remove(configPath); err != nil && !os.IsNotExist(err) {
+			fmt.Fprintf(commandView, "[red]Failed to remove config: %s[-]\n", err)
+		} else {
+			fmt.Fprintf(commandView, "[green]Alias unset. Reset to random: %s[-]\n", myAlias)
+		}
 
 	case "exit", "quit", "bye":
 		app.Stop()
@@ -811,7 +840,7 @@ func handleSessionInput(input string) {
 			return
 		}
 
-		available := []string{"connect", "room", "peers", "status", "help", "id", "exit", "quit", "bye", "bootstrap", "send", "chat"}
+		available := []string{"connect", "room", "peers", "status", "help", "id", "exit", "quit", "bye", "bootstrap", "send", "chat", "alias", "unset"}
 		resolved, err := resolveCommand(parts[0], available)
 		if err != nil {
 			fmt.Fprintf(commandView, "[red]%s[-]\n", err)
@@ -1216,6 +1245,22 @@ func loadOrGenerateKey(path string) (crypto.PrivKey, error) {
 func fileExists(filename string) bool {
 	info, err := os.Stat(filename)
 	return !os.IsNotExist(err) && !info.IsDir()
+}
+
+func generateRandomAlias() string {
+	return fmt.Sprintf("Pooper-%04d", mrand.Intn(10000))
+}
+
+func saveAliasConfig(alias string) error {
+	os.MkdirAll(filepath.Dir(configPath), 0755)
+	cfg := struct {
+		Alias string `json:"alias"`
+	}{Alias: alias}
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(configPath, data, 0644)
 }
 
 /*
