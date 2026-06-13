@@ -58,6 +58,7 @@ const (
 // ****************************************************************************
 var (
 	appName              = "poop"
+	appURL               = "https://github.com/jplozf/poop"
 	appMajorVersion      = "0"
 	GitVersion           = "dev"
 	previousStatus       AppState
@@ -1287,7 +1288,8 @@ func checkForUpdates() {
 	// If the remote SHA does not start with our local short hash, a new version exists
 	if !strings.HasPrefix(commit.Sha, currentHash) {
 		app.QueueUpdateDraw(func() {
-			fmt.Fprintf(commandView, "[yellow][Update] A newer version is available on GitHub! (Latest: %s)[-]\n", commit.Sha[:7])
+			fmt.Fprintf(commandView, "[yellow]A newer version is available on GitHub ! (Latest: %s)[-]\n", commit.Sha[:7])
+			fmt.Fprintf(commandView, "[yellow]Please visit %s to download the latest version)[-]\n", appURL)
 		})
 	}
 }
