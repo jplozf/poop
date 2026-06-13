@@ -235,7 +235,8 @@ func main() {
 		AddItem(inputField, 1, 1, true)
 
 	fullVersion := fmt.Sprintf("%s.%s", appMajorVersion, GitVersion)
-	fmt.Fprintf(commandView, "[yellow]Welcome to Poop P2P (v%s).[-]\n", fullVersion)
+	fmt.Fprintf(commandView, "[yellow]Welcome to Poop v%s[-]\n", fullVersion)
+	fmt.Fprintf(commandView, "Please, type 'help' for info.\n")
 	go checkForUpdates()
 
 	// 1. Create the Libp2p Host with NAT traversal capabilities
@@ -793,7 +794,20 @@ func handleCommandInput(input string, h host.Host) {
 		sessionMu.RUnlock()
 
 	case "help":
-		fmt.Fprintln(commandView, "Available commands: connect <addr>, room <name>, bootstrap <addr>, send <path>, alias <name>, unset alias, id, peers, status, exit, quit, bye, help")
+		fmt.Fprintln(commandView, "Available commands: connect <addr>")
+		fmt.Fprintln(commandView, "                    room <name>")
+		fmt.Fprintln(commandView, "                    bootstrap <addr>")
+		fmt.Fprintln(commandView, "                    send <path>")
+		fmt.Fprintln(commandView, "                    alias <name>")
+		fmt.Fprintln(commandView, "                    unset alias")
+		fmt.Fprintln(commandView, "                    id")
+		fmt.Fprintln(commandView, "                    peers")
+		fmt.Fprintln(commandView, "                    status")
+		fmt.Fprintln(commandView, "                    exit, quit, bye")
+		fmt.Fprintln(commandView, "                    help")
+
+		fmt.Fprintln(commandView, "These commands should be preceded by a '/' when in chat mode.")
+		fmt.Fprintln(commandView, "These commands could be shortened as long as they are unambiguous.")
 
 	case "id":
 		fmt.Fprintf(commandView, "[yellow]Share this address with your peer:[-]\n")
