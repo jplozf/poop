@@ -1303,7 +1303,7 @@ func checkForUpdates() {
 	if !strings.HasPrefix(commit.Sha, currentHash) {
 		app.QueueUpdateDraw(func() {
 			fmt.Fprintf(commandView, "[yellow]A newer version is available on GitHub ! (Latest: %s)[-]\n", commit.Sha[:7])
-			fmt.Fprintf(commandView, "[yellow]Please visit %s to download the latest version)[-]\n", appURL)
+			fmt.Fprintf(commandView, "[yellow]Please visit %s to download the latest version.[-]\n", appURL)
 		})
 	}
 }
